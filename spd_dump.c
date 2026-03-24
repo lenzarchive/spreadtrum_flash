@@ -1145,13 +1145,18 @@ rloop:
 		}
 		else if (!strcmp(str2[1], "blk_size") || !strcmp(str2[1], "bs")) {
 			if (argcount <= 2) { DBG_LOG("blk_size byte\n\tmax is 65535\n"); argc = 1; continue; }
-			blk_size = strtol(str2[2], NULL, 0);
+			int requested = strtol(str2[2], NULL, 0);
+			blk_size = requested;
 #ifndef _MYDEBUG
 			blk_size = blk_size < 0 ? 0 :
 				blk_size > 0xf800 ? 0xf800 : ((blk_size + 0x7FF) & ~0x7FF);
+			if (blk_size != requested)
+				DBG_LOG("blk_size: requested %d, adjusted to %d (must be multiple of 2048, max 0xf800)\n",
+				        requested, blk_size);
 #else
 			blk_size = blk_size < 0 ? 0 : blk_size;
 #endif
+			DBG_LOG("blk_size set to %d\n", blk_size);
 			argc -= 2; argv += 2;
 
 		}

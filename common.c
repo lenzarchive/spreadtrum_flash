@@ -859,9 +859,19 @@ static progress_state_t g_prog;
 
 #if _WIN32
 static HANDLE g_prog_thread_handle = NULL;
+static CRITICAL_SECTION g_prog_mutex;
+#define PROG_MUTEX_INIT()   InitializeCriticalSection(&g_prog_mutex)
+#define PROG_MUTEX_LOCK()   EnterCriticalSection(&g_prog_mutex)
+#define PROG_MUTEX_UNLOCK() LeaveCriticalSection(&g_prog_mutex)
+#define PROG_MUTEX_DESTROY() DeleteCriticalSection(&g_prog_mutex)
 #else
 static pthread_t g_prog_pthread;
 static int       g_prog_pthread_started = 0;
+static pthread_mutex_t g_prog_mutex = PTHREAD_MUTEX_INITIALIZER;
+#define PROG_MUTEX_INIT()    ((void)0)
+#define PROG_MUTEX_LOCK()    pthread_mutex_lock(&g_prog_mutex)
+#define PROG_MUTEX_UNLOCK()  pthread_mutex_unlock(&g_prog_mutex)
+#define PROG_MUTEX_DESTROY() pthread_mutex_destroy(&g_prog_mutex)
 #endif
 
 static void render_progress_now(void) {
@@ -869,6 +879,7 @@ static void render_progress_now(void) {
 	uint64_t total = g_prog.total;
 	unsigned long long now = GetTickCount64();
 
+	PROG_MUTEX_LOCK();
 	int h = (g_prog.hist_head + 1) % PROGRESS_HIST_LEN;
 	g_prog.hist_ms[h]    = now;
 	g_prog.hist_bytes[h] = done;
@@ -876,12 +887,20 @@ static void render_progress_now(void) {
 	if (g_prog.hist_count < PROGRESS_HIST_LEN) g_prog.hist_count++;
 
 	double speed_mbps = 0.0;
-	if (g_prog.hist_count > 1) {
-		int oldest = (h - g_prog.hist_count + 1 + PROGRESS_HIST_LEN) % PROGRESS_HIST_LEN;
-		unsigned long long dt = now - g_prog.hist_ms[oldest];
+	/* Bug #3 fix: clamp hist_count agar oldest tidak wrap ke indeks yang salah */
+	int hcount = g_prog.hist_count;
+	if (hcount > PROGRESS_HIST_LEN) hcount = PROGRESS_HIST_LEN;
+	if (hcount > 1) {
+		int oldest = (h - hcount + 1 + PROGRESS_HIST_LEN) % PROGRESS_HIST_LEN;
+		unsigned long long t_old = g_prog.hist_ms[oldest];
+		uint64_t b_old = g_prog.hist_bytes[oldest];
+		PROG_MUTEX_UNLOCK();
+		unsigned long long dt = now - t_old;
 		if (dt > 0)
-			speed_mbps = (double)(done - g_prog.hist_bytes[oldest])
+			speed_mbps = (double)(done - b_old)
 			             * 1000.0 / (double)dt / 1024.0 / 1024.0;
+	} else {
+		PROG_MUTEX_UNLOCK();
 	}
 
 	int filled = (total > 0) ? (int)(PROGRESS_BAR_WIDTH * done / (double)total) : 0;
@@ -919,6 +938,7 @@ static void *progress_thread_func(void *arg) {
 #endif
 
 void start_progress(uint64_t total) {
+	PROG_MUTEX_INIT();
 	memset(&g_prog, 0, sizeof(g_prog));
 	g_prog.total   = total;
 	g_prog.time0   = GetTickCount64();
@@ -949,10 +969,12 @@ void stop_progress(void) {
 		g_prog_pthread_started = 0;
 	}
 #endif
+	/* Thread sudah selesai (join), aman render sekali lagi dari main thread */
 	g_prog.done = g_prog.total;
 	render_progress_now();
 	fprintf(stderr, "\n");
 	fflush(stderr);
+	PROG_MUTEX_DESTROY();
 }
 
 extern uint64_t fblk_size;
@@ -1411,8 +1433,10 @@ void load_partition(spdio_t *io, const char *name,
 			if (io->verbose >= 1) DBG_LOG("send (%d)\n", n);
 			if (ret != (int)n)
 				ERR_EXIT("usb_send failed (%d / %d)\n", ret, n);
+			update_progress(offset + n);
 			if (is_simg) ret = recv_msg_timeout(io, 100000);
-			else ret = recv_msg_timeout(io, 15000);
+			else if (n == n64) ret = recv_msg_timeout(io, 60000);
+			else ret = recv_msg_timeout(io, 30000);
 			if (!ret) {
 				if (n == n64) ERR_EXIT("signature verification of \"%s\" failed or timeout reached\n", name);
 				else ERR_EXIT("timeout reached\n");
@@ -1421,7 +1445,6 @@ void load_partition(spdio_t *io, const char *name,
 				DBG_LOG("unexpected response (0x%04x)\n", ret);
 				break;
 			}
-			update_progress(offset + n);
 		}
 		free(rawbuf);
 	}
@@ -1434,8 +1457,10 @@ fallback_load:
 				ERR_EXIT("fread(load) failed\n");
 			encode_msg_nocpy(io, BSL_CMD_MIDST_DATA, n);
 			send_msg(io);
+			update_progress(offset + n);
 			if (is_simg) ret = recv_msg_timeout(io, 100000);
-			else ret = recv_msg_timeout(io, 15000);
+			else if (n == n64) ret = recv_msg_timeout(io, 60000);
+			else ret = recv_msg_timeout(io, 30000);
 			if (!ret) {
 				if (n == n64) ERR_EXIT("signature verification of \"%s\" failed or timeout reached\n", name);
 				else ERR_EXIT("timeout reached\n");
@@ -1444,7 +1469,6 @@ fallback_load:
 				DBG_LOG("unexpected response (0x%04x)\n", ret);
 				break;
 			}
-			update_progress(offset + n);
 		}
 #if !USE_LIBUSB
 	}
@@ -1452,8 +1476,16 @@ fallback_load:
 	stop_progress();
 	fclose(fi);
 	encode_msg_nocpy(io, BSL_CMD_END_DATA, 0);
-	if (!send_and_check(io)) DBG_LOG("Write Part Done: %s, target: 0x%llx, written: 0x%llx\n",
-		name, (long long)len, (long long)offset);
+	send_msg(io);
+	ret = recv_msg_timeout(io, 60000);
+	if (!ret) {
+		ERR_EXIT("timeout waiting for END_DATA ack on \"%s\"\n", name);
+	} else if (recv_type(io) != BSL_REP_ACK) {
+		DBG_LOG("unexpected response to END_DATA (0x%04x)\n", recv_type(io));
+	} else {
+		DBG_LOG("Write Part Done: %s, target: 0x%llx, written: 0x%llx\n",
+			name, (long long)len, (long long)offset);
+	}
 }
 
 void load_partition_force(spdio_t *io, const int id, const char *fn, unsigned step) {
