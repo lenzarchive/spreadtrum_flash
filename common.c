@@ -841,26 +841,118 @@ unsigned long long GetTickCount64() {
 #endif
 
 #define PROGRESS_BAR_WIDTH 40
+#define PROGRESS_INTERVAL_MS 100
+#define PROGRESS_HIST_LEN 8
 
-void print_progress_bar(uint64_t done, uint64_t total, unsigned long long time0) {
-	static int completed0 = 0;
-	static uint64_t done0 = 0;
-	unsigned long long time = GetTickCount64();
-	if (completed0 == PROGRESS_BAR_WIDTH) { completed0 = 0; done0 = 0; }
-	int completed = (int)(PROGRESS_BAR_WIDTH * done / (double)total);
-	if (completed != completed0) {
-		int remaining = PROGRESS_BAR_WIDTH - completed;
-		DBG_LOG("[");
-		for (int i = 0; i < completed; i++) {
-			DBG_LOG("=");
-		}
-		for (int i = 0; i < remaining; i++) {
-			DBG_LOG(" ");
-		}
-		DBG_LOG("]%6.1f%% Speed:%6.2fMb/s\r", 100 * done / (double)total, (double)1000 * done / (time - time0) / 1024 / 1024);
-		completed0 = completed;
-		done0 = done;
+typedef struct {
+	volatile uint64_t done;
+	uint64_t          total;
+	volatile int      running;
+	unsigned long long time0;
+	unsigned long long hist_ms[PROGRESS_HIST_LEN];
+	uint64_t           hist_bytes[PROGRESS_HIST_LEN];
+	int                hist_head;
+	int                hist_count;
+} progress_state_t;
+
+static progress_state_t g_prog;
+
+#if _WIN32
+static HANDLE g_prog_thread_handle = NULL;
+#else
+static pthread_t g_prog_pthread;
+static int       g_prog_pthread_started = 0;
+#endif
+
+static void render_progress_now(void) {
+	uint64_t done  = g_prog.done;
+	uint64_t total = g_prog.total;
+	unsigned long long now = GetTickCount64();
+
+	int h = (g_prog.hist_head + 1) % PROGRESS_HIST_LEN;
+	g_prog.hist_ms[h]    = now;
+	g_prog.hist_bytes[h] = done;
+	g_prog.hist_head     = h;
+	if (g_prog.hist_count < PROGRESS_HIST_LEN) g_prog.hist_count++;
+
+	double speed_mbps = 0.0;
+	if (g_prog.hist_count > 1) {
+		int oldest = (h - g_prog.hist_count + 1 + PROGRESS_HIST_LEN) % PROGRESS_HIST_LEN;
+		unsigned long long dt = now - g_prog.hist_ms[oldest];
+		if (dt > 0)
+			speed_mbps = (double)(done - g_prog.hist_bytes[oldest])
+			             * 1000.0 / (double)dt / 1024.0 / 1024.0;
 	}
+
+	int filled = (total > 0) ? (int)(PROGRESS_BAR_WIDTH * done / (double)total) : 0;
+	if (filled > PROGRESS_BAR_WIDTH) filled = PROGRESS_BAR_WIDTH;
+	char bar[PROGRESS_BAR_WIDTH + 1];
+	int i;
+	for (i = 0; i < filled; i++)               bar[i] = '=';
+	for (; i < PROGRESS_BAR_WIDTH; i++)         bar[i] = ' ';
+	bar[PROGRESS_BAR_WIDTH] = '\0';
+
+	fprintf(stderr, "[%s]%6.1f%%  Speed:%6.2f MB/s\r", bar,
+	        (total > 0) ? 100.0 * done / (double)total : 0.0,
+	        speed_mbps);
+	fflush(stderr);
+}
+
+#if _WIN32
+static DWORD WINAPI progress_thread_func(LPVOID arg) {
+	(void)arg;
+	while (g_prog.running) {
+		Sleep(PROGRESS_INTERVAL_MS);
+		render_progress_now();
+	}
+	return 0;
+}
+#else
+static void *progress_thread_func(void *arg) {
+	(void)arg;
+	while (g_prog.running) {
+		usleep(PROGRESS_INTERVAL_MS * 1000);
+		render_progress_now();
+	}
+	return NULL;
+}
+#endif
+
+void start_progress(uint64_t total) {
+	memset(&g_prog, 0, sizeof(g_prog));
+	g_prog.total   = total;
+	g_prog.time0   = GetTickCount64();
+	g_prog.running = 1;
+#if _WIN32
+	g_prog_thread_handle = CreateThread(NULL, 0, progress_thread_func, NULL, 0, NULL);
+#else
+	pthread_create(&g_prog_pthread, NULL, progress_thread_func, NULL);
+	g_prog_pthread_started = 1;
+#endif
+}
+
+void update_progress(uint64_t done) {
+	g_prog.done = done;
+}
+
+void stop_progress(void) {
+	g_prog.running = 0;
+#if _WIN32
+	if (g_prog_thread_handle) {
+		WaitForSingleObject(g_prog_thread_handle, 3000);
+		CloseHandle(g_prog_thread_handle);
+		g_prog_thread_handle = NULL;
+	}
+#else
+	if (g_prog_pthread_started) {
+		pthread_join(g_prog_pthread, NULL);
+		g_prog_pthread_started = 0;
+	}
+#endif
+	g_prog.done = g_prog.total;
+	render_progress_now();
+	fprintf(stderr, "\n");
+	fflush(stderr);
 }
 
 extern uint64_t fblk_size;
@@ -893,7 +985,7 @@ uint64_t dump_partition(spdio_t *io,
 	FILE *fo = my_fopen(fn, "wb");
 	if (!fo) ERR_EXIT("fopen(dump) failed\n");
 
-	unsigned long long time_start = GetTickCount64();
+	start_progress(len);
 	for (offset = start; (n64 = start + len - offset); ) {
 		uint32_t *data = (uint32_t *)io->temp_buf;
 		n = (uint32_t)(n64 > step ? step : n64);
@@ -916,7 +1008,7 @@ uint64_t dump_partition(spdio_t *io,
 			ERR_EXIT("unexpected length\n");
 		if (fwrite(io->raw_buf + 4, 1, nread, fo) != nread)
 			ERR_EXIT("fwrite(dump) failed\n");
-		print_progress_bar(offset + nread - start, len, time_start);
+		update_progress(offset + nread - start);
 		offset += nread;
 		if (n != nread) break;
 
@@ -925,7 +1017,8 @@ uint64_t dump_partition(spdio_t *io,
 			if (saved_size >= fblk_size) { usleep(1000000); saved_size = 0; }
 		}
 	}
-	DBG_LOG("\nRead Part Done: %s+0x%llx, target: 0x%llx, read: 0x%llx\n",
+	stop_progress();
+	DBG_LOG("Read Part Done: %s+0x%llx, target: 0x%llx, read: 0x%llx\n",
 		name, (long long)start, (long long)len,
 		(long long)(offset - start));
 	fclose(fo);
@@ -1281,7 +1374,8 @@ void load_partition(spdio_t *io, const char *name,
 	select_partition(io, name, len, mode64, BSL_CMD_START_DATA);
 	if (send_and_check(io)) { fclose(fi); return; }
 
-	unsigned long long time_start = GetTickCount64();
+	unsigned long long time_start = GetTickCount64(); (void)time_start;
+	start_progress(len);
 #if !USE_LIBUSB
 	if (Da_Info.bSupportRawData) {
 		if (Da_Info.bSupportRawData > 1) {
@@ -1327,7 +1421,7 @@ void load_partition(spdio_t *io, const char *name,
 				DBG_LOG("unexpected response (0x%04x)\n", ret);
 				break;
 			}
-			print_progress_bar(offset + n, len, time_start);
+			update_progress(offset + n);
 		}
 		free(rawbuf);
 	}
@@ -1350,14 +1444,15 @@ fallback_load:
 				DBG_LOG("unexpected response (0x%04x)\n", ret);
 				break;
 			}
-			print_progress_bar(offset + n, len, time_start);
+			update_progress(offset + n);
 		}
 #if !USE_LIBUSB
 	}
 #endif
+	stop_progress();
 	fclose(fi);
 	encode_msg_nocpy(io, BSL_CMD_END_DATA, 0);
-	if (!send_and_check(io)) DBG_LOG("\nWrite Part Done: %s, target: 0x%llx, written: 0x%llx\n",
+	if (!send_and_check(io)) DBG_LOG("Write Part Done: %s, target: 0x%llx, written: 0x%llx\n",
 		name, (long long)len, (long long)offset);
 }
 

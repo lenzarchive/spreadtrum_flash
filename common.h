@@ -35,14 +35,14 @@ DWORD WINAPI ThrdFunc(LPVOID lpParam);
 #endif
 #else
 #include <dirent.h>
-#endif
-
-#if USE_LIBUSB
-#include <libusb-1.0/libusb.h>
 #ifndef _MSC_VER
 #include <pthread.h>
 #include <unistd.h>
 #endif
+#endif
+
+#if USE_LIBUSB
+#include <libusb-1.0/libusb.h>
 #else
 #include <setupapi.h>
 #include "Wrapper.h"
@@ -251,3 +251,6 @@ void dm_disable(spdio_t *io, unsigned step);
 void dm_enable(spdio_t *io, unsigned step);
 void w_mem_to_part_offset(spdio_t *io, const char *name, size_t offset, uint8_t *mem, size_t length, unsigned step);
 void set_active(spdio_t *io, char *arg);
+void start_progress(uint64_t total);
+void update_progress(uint64_t done);
+void stop_progress(void);
